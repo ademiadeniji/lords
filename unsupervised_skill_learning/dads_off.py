@@ -22,6 +22,7 @@ import os
 import io
 from absl import flags, logging
 import functools
+import pdb
 
 import sys
 sys.path.append(os.path.abspath('./'))
@@ -40,6 +41,8 @@ from tf_agents.trajectories import time_step as ts
 from tf_agents.environments.suite_gym import wrap_env
 from tf_agents.trajectories.trajectory import from_transition, to_transition
 from tf_agents.networks import actor_distribution_network
+from tf_agents.networks import encoding_network
+from networks import multiplex_sac_network
 from tf_agents.networks import normal_projection_network
 from tf_agents.policies import ou_noise_policy
 from tf_agents.trajectories import policy_step
@@ -49,6 +52,8 @@ from tf_agents.specs import array_spec
 from tf_agents.specs import tensor_spec
 from tf_agents.utils import common
 from tf_agents.utils import nest_utils
+from tensorflow.python.framework import tensor_spec as tspec
+
 
 import dads_agent
 
@@ -78,6 +83,8 @@ flags.DEFINE_integer('max_env_steps', 200,
                      'Maximum number of steps in one episode')
 flags.DEFINE_integer('reduced_observation', 0,
                      'Predict dynamics in a reduced observation space')
+flags.DEFINE_boolean('mask_observation', False, 
+                     'Whether to use pretrained mask')
 flags.DEFINE_integer(
     'min_steps_before_resample', 50,
     'Minimum number of steps to execute before resampling skill')
@@ -115,6 +122,9 @@ flags.DEFINE_string('skill_type', 'cont_uniform',
 flags.DEFINE_integer(
     'hidden_layer_size', 512,
     'Hidden layer size, shared by actors, critics and dynamics')
+flags.DEFINE_boolean(
+  'multihead', False, 'Whether to use multihead skill policy'
+)
 
 # reward structure
 flags.DEFINE_integer(
@@ -238,7 +248,7 @@ def get_environment(env_name='point_mass'):
     env = ant.AntEnv(
         expose_all_qpos=True,
         task='motion')
-    observation_omit_size = 2
+    observation_omit_size = 0
   elif env_name == 'Ant-v1_goal':
     observation_omit_size = 2
     return wrap_env(
@@ -703,14 +713,17 @@ def eval_loop(eval_dir,
     # all_trajectories = []
     # all_predicted_trajectories = []
 
+  skill_one_hot = np.zeros(FLAGS.num_evals)
+  skill_one_hot[0] = 1
   for idx in range(num_evals):
     if FLAGS.num_skills > 0:
       if FLAGS.deterministic_eval:
         preset_skill = np.zeros(FLAGS.num_skills, dtype=np.int64)
         preset_skill[idx] = 1
       elif FLAGS.skill_type == 'discrete_uniform':
-        preset_skill = np.random.multinomial(1, [1. / FLAGS.num_skills] *
-                                             FLAGS.num_skills)
+         preset_skill = np.random.multinomial(1, [1. / FLAGS.num_skills] *
+                                              FLAGS.num_skills)
+        #preset_skill = np.roll(skill_one_hot, idx) 
       elif FLAGS.skill_type == 'gaussian':
         preset_skill = np.random.multivariate_normal(
             np.zeros(FLAGS.num_skills), np.eye(FLAGS.num_skills))
@@ -1151,20 +1164,51 @@ def main(_):
           py_env_time_step_spec.observation.shape[0] - FLAGS.num_skills)
     else:
       skill_dynamics_observation_size = FLAGS.reduced_observation
+    
+    if FLAGS.multihead:
+      z_spec = tspec.BoundedTensorSpec(
+                shape=[256],
+                dtype=tf.int64,
+                minimum=0,
+                maximum=FLAGS.num_skills-1,
+                name='observation_z')
+      actor_net = multiplex_sac_network.MultiplexActorDistributionNetwork(
+          tf_agent_time_step_spec.observation,
+          tf_action_spec,
+          z_spec,
+          obs_encoder_ctor=encoding_network.EncodingNetwork,
+          fc_layer_params=(FLAGS.hidden_layer_size,) * 2,)
+      
+      critic_net = multiplex_sac_network.MultiplexCriticNetwork(
+          (tf_agent_time_step_spec.observation, tf_action_spec),
+          z_spec,
+          obs_encoder_ctor=encoding_network.EncodingNetwork,
+          fc_layer_params=(FLAGS.hidden_layer_size,) * 2,)
+    else:
+      # TODO(architsh): Shift co-ordinate hiding to actor_net and critic_net (good for futher image based processing as well)
+      actor_net = actor_distribution_network.ActorDistributionNetwork(
+          tf_agent_time_step_spec.observation,
+          tf_action_spec,
+          fc_layer_params=(FLAGS.hidden_layer_size,) * 2,
+          continuous_projection_net=_normal_projection_net)
 
-    # TODO(architsh): Shift co-ordinate hiding to actor_net and critic_net (good for futher image based processing as well)
-    actor_net = actor_distribution_network.ActorDistributionNetwork(
-        tf_agent_time_step_spec.observation,
-        tf_action_spec,
-        fc_layer_params=(FLAGS.hidden_layer_size,) * 2,
-        continuous_projection_net=_normal_projection_net)
+      critic_net = critic_network.CriticNetwork(
+          (tf_agent_time_step_spec.observation, tf_action_spec),
+          observation_fc_layer_params=None,
+          action_fc_layer_params=None,
+          joint_fc_layer_params=(FLAGS.hidden_layer_size,) * 2)
 
-    critic_net = critic_network.CriticNetwork(
-        (tf_agent_time_step_spec.observation, tf_action_spec),
-        observation_fc_layer_params=None,
-        action_fc_layer_params=None,
-        joint_fc_layer_params=(FLAGS.hidden_layer_size,) * 2)
-
+    if FLAGS.mask_observation:
+        raw_obs_size = env_obs_spec.shape[0] - FLAGS.num_skills
+        observation_mask = tf.Variable(tf.zeros(shape=(raw_obs_size,), dtype=tf.float64), trainable=True, \
+            shape=(raw_obs_size,), name='observation_mask', dtype=tf.float64)
+        observation_mask_checkpointer = common.Checkpointer(
+          ckpt_dir=os.path.join(root_dir, 'observation_mask'),
+          observation_mask=observation_mask,
+          global_step=global_step
+      )
+    else:
+        observation_mask = None
     if FLAGS.skill_dynamics_relabel_type is not None and 'importance_sampling' in FLAGS.skill_dynamics_relabel_type and FLAGS.is_clip_eps > 1.0:
       reweigh_batches_flag = True
     else:
@@ -1174,6 +1218,7 @@ def main(_):
         # DADS parameters
         save_dir,
         skill_dynamics_observation_size,
+        observation_mask=observation_mask,
         observation_modify_fn=process_observation,
         restrict_input_size=observation_omit_size,
         latent_size=FLAGS.num_skills,
@@ -1263,6 +1308,10 @@ def main(_):
         ckpt_dir=os.path.join(save_dir, 'replay_buffer'),
         max_to_keep=1,
         replay_buffer=rbuffer)
+    actor_checkpointer = common.Checkpointer(
+        ckpt_dir=os.path.join(save_dir, 'actor_net'),
+        actor_net=actor_net,
+        global_step=global_step)
 
     setup_time = time.time() - start_time
     print('Setup time:', setup_time)
@@ -1270,6 +1319,8 @@ def main(_):
     with tf.compat.v1.Session().as_default() as sess:
       train_checkpointer.initialize_or_restore(sess)
       rb_checkpointer.initialize_or_restore(sess)
+      if FLAGS.mask_observation:
+        observation_mask_checkpointer.initialize_or_restore()
       agent.set_sessions(
           initialize_or_restore_skill_dynamics=True, session=sess)
 
@@ -1327,6 +1378,7 @@ def main(_):
             print('Saving stuff')
             train_checkpointer.save(global_step=iter_count)
             policy_checkpointer.save(global_step=iter_count)
+            actor_checkpointer.save(global_step=iter_count)
             rb_checkpointer.save(global_step=iter_count)
             agent.save_variables(global_step=iter_count)
 

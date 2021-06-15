@@ -27,6 +27,7 @@ import numpy as np
 import tensorflow as tf
 
 from tf_agents.agents.sac import sac_agent
+# from utils import sac_agent
 
 import skill_dynamics
 
@@ -38,6 +39,7 @@ class DADSAgent(sac_agent.SacAgent):
   def __init__(self,
                save_directory,
                skill_dynamics_observation_size,
+               observation_mask,
                observation_modify_fn=None,
                restrict_input_size=0,
                latent_size=2,
@@ -75,6 +77,7 @@ class DADSAgent(sac_agent.SacAgent):
         observation_size=skill_dynamics_observation_size,
         action_size=self._latent_size,
         restrict_observation=self._restrict_input_size,
+        observation_mask=observation_mask,
         normalize_observations=normalize_observations,
         fc_layer_params=fc_layer_params,
         network_type=network_type,
