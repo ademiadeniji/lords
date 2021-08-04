@@ -22,6 +22,7 @@ import os
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
+import pdb
 
 
 # TODO(architsh): Implement the dynamics with last K step input
@@ -33,6 +34,7 @@ class SkillDynamics:
       action_size,
       restrict_observation=0,
       observation_mask=None,
+      mask_observation=False,
       normalize_observations=False,
       # network properties
       fc_layer_params=(256, 256),
@@ -48,6 +50,7 @@ class SkillDynamics:
     self._normalize_observations = normalize_observations
     self._restrict_observation = restrict_observation
     self._observation_mask = observation_mask
+    self._mask_observation = mask_observation
     self._reweigh_batches = reweigh_batches
 
     # tensorflow requirements
@@ -298,15 +301,9 @@ class SkillDynamics:
             scale=False, center=False, name='output_normalization')
         next_timesteps = self.output_norm_layer(
             next_timesteps, training=is_training)
-      
-      # mask = tf.zeros(timesteps.shape[-1])
-      # adder_0 = tf.one_hot(0, mask.shape[-1])
-      # adder_1 = tf.one_hot(1, mask.shape[-1])
-      # mask = mask + adder_0 + adder_1
-      # timesteps = timesteps[:, :0]
-      # next_timesteps *= mask
+
       with tf.compat.v1.variable_scope("observation_mask"):
-        if self._observation_mask is not None:
+        if self._observation_mask is not None and self._mask_observation:
           sigmask = tf.math.sigmoid(self._observation_mask) 
           max_val = tf.math.reduce_max(sigmask)
           cutoff = tf.math.floor(log10(max_val))

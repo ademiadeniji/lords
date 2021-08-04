@@ -24,6 +24,9 @@ from absl import flags, logging
 import functools
 import pdb
 
+import gym
+from gym.wrappers import FlattenObservation
+
 import sys
 sys.path.append(os.path.abspath('./'))
 
@@ -35,6 +38,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from tf_agents.agents.ddpg import critic_network
+from networks import latent_critic_network
 from tf_agents.agents.sac import sac_agent
 from tf_agents.environments import suite_mujoco
 from tf_agents.trajectories import time_step as ts
@@ -56,6 +60,8 @@ from tensorflow.python.framework import tensor_spec as tspec
 
 
 import dads_agent
+from tf_agents.policies import actor_policy
+from policies import latent_policy
 
 from envs import skill_wrapper
 from envs import video_wrapper
@@ -63,6 +69,7 @@ from envs.gym_mujoco import ant
 from envs.gym_mujoco import half_cheetah
 from envs.gym_mujoco import humanoid
 from envs.gym_mujoco import point_mass
+from envs import push_primitives
 
 from envs import dclaw
 from envs import dkitty_redesign
@@ -85,6 +92,18 @@ flags.DEFINE_integer('reduced_observation', 0,
                      'Predict dynamics in a reduced observation space')
 flags.DEFINE_boolean('mask_observation', False, 
                      'Whether to use pretrained mask')
+flags.DEFINE_boolean('embed_obs_policy', False, 
+                     'Whether to use pretrained embedding network for policy')
+flags.DEFINE_boolean('mask_obs_policy', False, 
+                     'Whether to use pretrained observation mask for policy')
+flags.DEFINE_boolean('handcraft_obs_policy', False, 
+                     'Whether to use handcrafted observation for policy')
+flags.DEFINE_boolean('embed_obs_critic', False, 
+                     'Whether to use pretrained embedding network for critic')
+flags.DEFINE_boolean('mask_obs_critic', False, 
+                     'Whether to use pretrained observation mask for critic')
+flags.DEFINE_boolean('handcraft_obs_critic', False, 
+                     'Whether to use handcrafted observation for critic')
 flags.DEFINE_integer(
     'min_steps_before_resample', 50,
     'Minimum number of steps to execute before resampling skill')
@@ -123,7 +142,7 @@ flags.DEFINE_integer(
     'hidden_layer_size', 512,
     'Hidden layer size, shared by actors, critics and dynamics')
 flags.DEFINE_boolean(
-  'multihead', False, 'Whether to use multihead skill policy'
+  'multiplex', False, 'Whether to use multiplex skill policy'
 )
 
 # reward structure
@@ -263,6 +282,9 @@ def get_environment(env_name='point_mass'):
         model_path='ant_footsensor.xml',
         expose_foot_sensors=True)
     observation_omit_size = 2
+  elif env_name == "FetchPushPrimitives-v1":
+    env = FlattenObservation(push_primitives.FetchPushPrimitivesEnv())
+    observation_omit_size = 0
   elif env_name == 'HalfCheetah-v1':
     env = half_cheetah.HalfCheetahEnv(expose_all_qpos=True, task='motion')
     observation_omit_size = 1
@@ -480,7 +502,12 @@ def process_observation(observation):
     red_obs = [_shape_based_observation_processing(observation, 0)]
   # x-y plane
   elif FLAGS.reduced_observation in [2, 6]:
-    if FLAGS.environment == 'Ant-v1' or 'DKitty' in FLAGS.environment or 'DClaw' in FLAGS.environment:
+    if 'FetchPushPrimitives' in FLAGS.environment:
+        red_obs = [
+            _shape_based_observation_processing(observation, 3),
+            _shape_based_observation_processing(observation, 4)
+        ]
+    elif FLAGS.environment == 'Ant-v1' or 'DKitty' in FLAGS.environment or 'DClaw' in FLAGS.environment:
       red_obs = [
           _shape_based_observation_processing(observation, 0),
           _shape_based_observation_processing(observation, 1)
@@ -708,12 +735,16 @@ def eval_loop(eval_dir,
     for line_style in ['-', '--', '-.', ':']:
       style_map += [color + line_style for color in color_map]
 
-    plt.xlim(-15, 15)
-    plt.ylim(-15, 15)
-    # all_trajectories = []
-    # all_predicted_trajectories = []
+    if "Fetch" in FLAGS.environment:    
+      plt.xlim(1.1, 1.5)
+      plt.ylim(0.6, 1.0)
+    else:
+      plt.xlim(-15, 15)
+      plt.ylim(-15, 15)
+      # all_trajectories = []
+      # all_predicted_trajectories = []
 
-  skill_one_hot = np.zeros(FLAGS.num_evals)
+  skill_one_hot = np.zeros(FLAGS.num_skills)
   skill_one_hot[0] = 1
   for idx in range(num_evals):
     if FLAGS.num_skills > 0:
@@ -721,9 +752,9 @@ def eval_loop(eval_dir,
         preset_skill = np.zeros(FLAGS.num_skills, dtype=np.int64)
         preset_skill[idx] = 1
       elif FLAGS.skill_type == 'discrete_uniform':
-         preset_skill = np.random.multinomial(1, [1. / FLAGS.num_skills] *
-                                              FLAGS.num_skills)
-        #preset_skill = np.roll(skill_one_hot, idx) 
+         #preset_skill = np.random.multinomial(1, [1. / FLAGS.num_skills] *
+      #                                        FLAGS.num_skills)
+        preset_skill = np.roll(skill_one_hot, idx) 
       elif FLAGS.skill_type == 'gaussian':
         preset_skill = np.random.multivariate_normal(
             np.zeros(FLAGS.num_skills), np.eye(FLAGS.num_skills))
@@ -740,10 +771,7 @@ def eval_loop(eval_dir,
         skill_wrapper.SkillWrapper(
             eval_env,
             num_latent_skills=FLAGS.num_skills,
-            skill_type=FLAGS.skill_type,
-            preset_skill=preset_skill,
-            min_steps_before_resample=FLAGS.min_steps_before_resample,
-            resample_prob=FLAGS.resample_prob),
+            skill_type=FLAGS.skill_type,),
         max_episode_steps=FLAGS.max_env_steps)
 
     # record videos for sampled trajectories
@@ -1133,10 +1161,7 @@ def main(_):
         skill_wrapper.SkillWrapper(
             py_env,
             num_latent_skills=FLAGS.num_skills,
-            skill_type=FLAGS.skill_type,
-            preset_skill=None,
-            min_steps_before_resample=FLAGS.min_steps_before_resample,
-            resample_prob=FLAGS.resample_prob),
+            skill_type=FLAGS.skill_type,),
         max_episode_steps=FLAGS.max_env_steps)
 
     # all specifications required for all networks and agents
@@ -1165,15 +1190,35 @@ def main(_):
     else:
       skill_dynamics_observation_size = FLAGS.reduced_observation
     
-    if FLAGS.multihead:
+    # Possibly constrain policy input
+    if FLAGS.embed_obs_policy:
+      actor_input_size = FLAGS.embedding_size + FLAGS.num_skills
+    elif FLAGS.mask_obs_policy:
+      actor_input_size = py_env_time_step_spec.observation.shape[0]
+    elif FLAGS.handcraft_obs_policy:
+      actor_input_size = 2 + FLAGS.num_skills
+    else:
+      actor_input_size = None
+
+    if FLAGS.embed_obs_policy or FLAGS.mask_obs_policy or FLAGS.handcraft_obs_policy:
+      actor_input_spec = tspec.BoundedTensorSpec(
+                shape=[actor_input_size],
+                dtype=tf.float32,
+                minimum=-100,
+                maximum=100,
+                name='policy_embedding')
+    else:
+      actor_input_spec = tf_agent_time_step_spec.observation
+
+    if FLAGS.multiplex:
       z_spec = tspec.BoundedTensorSpec(
-                shape=[256],
+                shape=[FLAGS.agent_batch_size],
                 dtype=tf.int64,
                 minimum=0,
                 maximum=FLAGS.num_skills-1,
                 name='observation_z')
       actor_net = multiplex_sac_network.MultiplexActorDistributionNetwork(
-          tf_agent_time_step_spec.observation,
+          actor_input_spec,
           tf_action_spec,
           z_spec,
           obs_encoder_ctor=encoding_network.EncodingNetwork,
@@ -1187,18 +1232,38 @@ def main(_):
     else:
       # TODO(architsh): Shift co-ordinate hiding to actor_net and critic_net (good for futher image based processing as well)
       actor_net = actor_distribution_network.ActorDistributionNetwork(
-          tf_agent_time_step_spec.observation,
+          actor_input_spec,
           tf_action_spec,
           fc_layer_params=(FLAGS.hidden_layer_size,) * 2,
           continuous_projection_net=_normal_projection_net)
+      # if FLAGS.embed_obs_critic:
+      #   critic_net = latent_critic_network.LatentCriticNetwork(
+      #       (tf_agent_time_step_spec.observation, tf_action_spec),
+      #       observation_fc_layer_params=None,
+      #       action_fc_layer_params=None,
+      #       joint_fc_layer_params=(FLAGS.hidden_layer_size,) * 2)
+      # elif FLAGS.mask_obs_critic:
+      #   critic_net = latent_critic_network.LatentCriticNetwork(
+      #       (tf_agent_time_step_spec.observation, tf_action_spec),
+      #       observation_fc_layer_params=None,
+      #       action_fc_layer_params=None,
+      #       joint_fc_layer_params=(FLAGS.hidden_layer_size,) * 2)
+      if FLAGS.handcraft_obs_critic:
+        critic_net = latent_critic_network.LatentCriticNetwork(
+            (tf_agent_time_step_spec.observation, tf_action_spec),
+            observation_fc_layer_params=None,
+            action_fc_layer_params=None,
+            joint_fc_layer_params=(FLAGS.hidden_layer_size,) * 2,
+            handcraft_obs_critic=FLAGS.handcraft_obs_critic,
+            num_skills=FLAGS.num_skills)
+      else:
+        critic_net = critic_network.CriticNetwork(
+            (tf_agent_time_step_spec.observation, tf_action_spec),
+            observation_fc_layer_params=None,
+            action_fc_layer_params=None,
+            joint_fc_layer_params=(FLAGS.hidden_layer_size,) * 2)
 
-      critic_net = critic_network.CriticNetwork(
-          (tf_agent_time_step_spec.observation, tf_action_spec),
-          observation_fc_layer_params=None,
-          action_fc_layer_params=None,
-          joint_fc_layer_params=(FLAGS.hidden_layer_size,) * 2)
-
-    if FLAGS.mask_observation:
+    if FLAGS.mask_observation or FLAGS.mask_obs_policy:
         raw_obs_size = env_obs_spec.shape[0] - FLAGS.num_skills
         observation_mask = tf.Variable(tf.zeros(shape=(raw_obs_size,), dtype=tf.float64), trainable=True, \
             shape=(raw_obs_size,), name='observation_mask', dtype=tf.float64)
@@ -1214,11 +1279,15 @@ def main(_):
     else:
       reweigh_batches_flag = False
 
+    if FLAGS.embed_obs_policy or FLAGS.mask_obs_policy or FLAGS.handcraft_obs_policy:
+      actor_policy_ctor = latent_policy.LatentPolicy
+    else:
+      actor_policy_ctor = actor_policy.ActorPolicy
+
     agent = dads_agent.DADSAgent(
         # DADS parameters
         save_dir,
         skill_dynamics_observation_size,
-        observation_mask=observation_mask,
         observation_modify_fn=process_observation,
         restrict_input_size=observation_omit_size,
         latent_size=FLAGS.num_skills,
@@ -1231,11 +1300,21 @@ def main(_):
         fix_variance=FLAGS.fix_variance,
         reweigh_batches=reweigh_batches_flag,
         skill_dynamics_learning_rate=FLAGS.skill_dynamics_lr,
+        # embedding_network_dads=embedding_net,
+        observation_mask_dads=observation_mask,
+        mask_observation=FLAGS.mask_observation,
         # SAC parameters
         time_step_spec=tf_agent_time_step_spec,
         action_spec=tf_action_spec,
         actor_network=actor_net,
+        actor_policy_ctor=actor_policy_ctor,
         critic_network=critic_net,
+        num_skills=FLAGS.num_skills,
+        embed_obs_policy=FLAGS.embed_obs_policy,
+        mask_obs_policy=FLAGS.mask_obs_policy,
+        handcraft_obs_policy=FLAGS.handcraft_obs_policy,
+        observation_mask=observation_mask,
+        # embedding_network=embedding_net,
         target_update_tau=0.005,
         target_update_period=1,
         actor_optimizer=tf.compat.v1.train.AdamOptimizer(
